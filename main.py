@@ -1,10 +1,9 @@
 import argparse
-import json
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import time
 import pandas as pd
 
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.exon_fetcher import GeneIsoformExonFetcher
 from src.psm import IsoformCoverageCalculator
 
@@ -35,7 +34,7 @@ def process_one_gene(gene: str, args, gene2prot) -> tuple[pd.DataFrame | None, d
     所有“落盘”的动作仍在各自基因目录下完成。
     """
     try:
-        out_dir = Path(f"/workspace/results/{gene}")
+        out_dir = Path(f"results/{gene}")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[INFO] >>> 处理基因: {gene}")
 
@@ -52,7 +51,7 @@ def process_one_gene(gene: str, args, gene2prot) -> tuple[pd.DataFrame | None, d
 
         # 各线程各自实例化，避免共享 Session/状态
         fetcher = GeneIsoformExonFetcher(timeout=30)
-        calc = IsoformCoverageCalculator('/workspace/src/pms.r')
+        calc = IsoformCoverageCalculator('src/pms.r')
 
         # 1) 获取 isoform/exon
         try:
@@ -95,7 +94,7 @@ def process_one_gene(gene: str, args, gene2prot) -> tuple[pd.DataFrame | None, d
 
         acc = iso.get("accession", "NA")
         seq_len = len(iso.get("sequence", "")) if isinstance(iso.get("sequence"), str) else 0
-        print(f"[INFO] 选用 isoform: {acc}  | 序列长度={seq_len} | 外显子数={len(iso.get('exons') or [])}")
+        print(f"[INFO] 选用 isoform: {list(ids_set)[0]}  | 序列长度={seq_len} | 外显子数={len(iso.get('exons') or [])}")
 
         # 5) 运行覆盖计算
         out_sample_csv = str(out_dir / f"{gene}_by_sample.csv")
@@ -178,11 +177,11 @@ def process_one_gene(gene: str, args, gene2prot) -> tuple[pd.DataFrame | None, d
 
 def main():
     ap = argparse.ArgumentParser(
-        description="用 GeneIsoformExonFetcher + IsoformCoverageCalculator 并发计算覆盖；输出到 /workspace/results/{Gene}"
+        description="计算覆盖 PSM"
     )
-    ap.add_argument("--report", default="/workspace/datasets/Match_result-X401SC24071912_Z01_F001_B1_43/report-matched-M0.csv")
+    ap.add_argument("--report", default="datasets/Match_result-X401SC24071912_Z01_F001_B1_43/report-matched-M0.csv")
     ap.add_argument("--gene", default="ALL")
-    ap.add_argument("--summary", default="/workspace/data/combined_69plus10_summary.csv")
+    ap.add_argument("--summary", default="data/combined_69plus10_summary.csv")
     ap.add_argument("--tax-id", default="9606")
 
     ap.add_argument("--isoform",   default="ALL")
@@ -200,6 +199,7 @@ def main():
 
     args = ap.parse_args()
 
+    start_time = time.time()
     # ==== 准备基因列表 ====
     summary_path = Path(args.summary)
     if not summary_path.exists():
@@ -234,7 +234,7 @@ def main():
     if uniq_psm_all_rows:
         uniq_all_df = pd.concat(uniq_psm_all_rows, ignore_index=True)
 
-        out_dir = Path("/workspace/results/_summary")
+        out_dir = Path("results")
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 明细
@@ -242,18 +242,7 @@ def main():
         uniq_all_df.to_csv(out_psm, index=False)
         print(f"[OK] 写出 unique-exon PSM 明细：{out_psm}")
 
-        # 按 sample(label) 汇总
-        sum_df = (
-            uniq_all_df
-            .groupby(["label"], as_index=False)["value"]
-            .sum()
-            .rename(columns={"value": "value_sum"})
-        )
-        out_sum = out_dir / "unique_psm_sum_by_sample.csv"
-        sum_df.to_csv(out_sum, index=False)
-        print(f"[OK] 写出 unique-exon 按 sample 汇总：{out_sum}")
-
-        # 按 id 聚合（保留 gene/canonical/isoform/label 维度）
+        # 统计
         sum_by_id = (
             uniq_all_df
             .groupby(["gene", "canonical", "isoform", "id", "label"], as_index=False)["value"]
@@ -265,6 +254,8 @@ def main():
         print(f"[OK] 写出 unique-exon 按 id 聚合：{out_sum_id}")
     else:
         print("[INFO] 没有任何 PSM 落入 unique exon 区间，未生成汇总文件。")
+    
+    print(f"[INFO] 覆盖计算全部完成，耗时 {time.time() - start_time:.1f} 秒")
 
 
 if __name__ == "__main__":

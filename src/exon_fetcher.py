@@ -1,11 +1,10 @@
-# -*- coding: utf-8 -*-
 import json
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from collections import defaultdict
-
 import requests
 import pandas as pd
+
+from collections import defaultdict
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
 
 class GeneIsoformExonFetcher:
@@ -115,9 +114,6 @@ class GeneIsoformExonFetcher:
         return isoforms
 
     def ebi_get_coordinates_for_accession(self, iso_acc: str, tax_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        调 EBI Proteins coordinates：返回该 isoform 的所有转录本及其外显子（左基因组坐标 / 右蛋白坐标）。
-        """
         params = {"accession": iso_acc}
         if tax_id:
             params["taxid"] = tax_id
@@ -149,14 +145,21 @@ class GeneIsoformExonFetcher:
             strand = strand_val if isinstance(strand_val, str) else ("+" if strand_val in (1, "+") else "-")
             exons = gloc.get("exon") or []
 
+            # 注意：EBI 返回的 exon 顺序常已按基因组排序；按需保留原顺序或轻微排序
             tx = {"ensembl_transcript_id": tx_id, "chromosome": chrom, "strand": strand, "exons": []}
             for i, ex in enumerate(sorted(exons, key=_exon_sort_key), start=1):
-                # 蛋白坐标
+                # ---- 蛋白坐标：兼容只有 position 的情况 ----
                 pl = self._pick(ex, "proteinLocation", "protein_location", "protLocation") or {}
                 p_begin = self._to_int_maybe(self._pick(pl, "begin"))
                 p_end   = self._to_int_maybe(self._pick(pl, "end"))
+                if p_begin is None and p_end is None:
+                    # 只有 position 时（可能是 {"position":{"position":123,"status":"certain"}}）
+                    pos_one = self._to_int_maybe(self._pick(pl, "position"))
+                    if pos_one is not None:
+                        p_begin = pos_one
+                        p_end   = pos_one
+                # -------------------------------------------
 
-                # 基因组坐标
                 gl = self._pick(ex, "genomicLocation", "genomeLocation", "location") or {}
                 g_begin = self._to_int_maybe(self._pick(gl, "begin", "start"))
                 g_end   = self._to_int_maybe(self._pick(gl, "end", "stop"))
@@ -209,14 +212,24 @@ class GeneIsoformExonFetcher:
         return out
 
     @staticmethod
-    def _flatten_isoform_exons(result_dict: Dict[str, Any]) -> Tuple[Dict[str, Dict[Tuple[str,int,int], Tuple[Optional[int], Optional[int]]]], List[Tuple[str,int,int]]]:
+    def _flatten_isoform_exons(
+        result_dict: Dict[str, Any]
+    ) -> Tuple[
+        Dict[str, Dict[Tuple[str, int, int], Tuple[Optional[int], Optional[int]]]],
+        List[Tuple[str, int, int]]
+    ]:
         """
-        拍平成:
-          exons_by_iso: dict[iso] -> dict[(chrom,start,end)] -> (p_start, p_end)
-          all_coords:   list[(chrom,start,end)]  按 chr,start,end 排序
+        收集 isoform → exons 映射，同时返回全体外显子坐标的排序列表。
+        排序规则：
+        - 先按 chrom 升序（字符串比较）
+        - 同一 chrom 内按 start 升序
+        - start 相同则按 end 升序
         """
-        exons_by_iso = defaultdict(dict)
-        all_coords_set = set()
+
+        from collections import defaultdict as _dd
+
+        exons_by_iso = _dd(dict)
+        seen = set()
 
         def _to_int_safe(v):
             try:
@@ -224,34 +237,57 @@ class GeneIsoformExonFetcher:
             except Exception:
                 return None
 
-        for iso in result_dict.get("isoforms", []):
-            iso_acc = iso["accession"]
-            coords = iso["coordinates"]
-            for tx in coords.get("transcripts", []):
+        collected = []
+
+        for iso in (result_dict.get("isoforms") or []):
+            iso_acc = iso.get("accession")
+            coords = iso.get("coordinates") or {}
+            for tx in (coords.get("transcripts") or []):
                 chrom = tx.get("chromosome")
-                for ex in tx.get("exons", []):
+                if chrom is None:
+                    continue
+                ch = str(chrom)
+                for ex in (tx.get("exons") or []):
                     g = (ex.get("genomic") or {})
                     p = (ex.get("protein") or {})
+
                     s, e = g.get("start"), g.get("end")
-                    if chrom is None or s is None or e is None:
+                    if s is None or e is None:
                         continue
-                    s, e = int(s), int(e)
+                    try:
+                        s, e = int(s), int(e)
+                    except Exception:
+                        continue
                     if s > e:
                         s, e = e, s
-                    key = (str(chrom), s, e)
-                    all_coords_set.add(key)
+                    key = (ch, s, e)
 
+                    # protein 坐标
                     ps, pe = _to_int_safe(p.get("start")), _to_int_safe(p.get("end"))
-                    # 如果同一 iso+坐标出现多次，只保留第一组非空蛋白坐标
+                    if ps is None and pe is None:
+                        pos_obj = p.get("position") or {}
+                        pos = _to_int_safe(pos_obj.get("position"))
+                        if pos is not None:
+                            ps = pe = pos
+
                     if key not in exons_by_iso[iso_acc]:
                         exons_by_iso[iso_acc][key] = (ps, pe)
                     else:
-                        old_ps, old_pe = exons_by_iso[iso_acc][key]
+                        old_ps, _ = exons_by_iso[iso_acc][key]
                         if old_ps is None and ps is not None:
                             exons_by_iso[iso_acc][key] = (ps, pe)
 
-        all_coords = sorted(all_coords_set, key=lambda t: (t[0], t[1], t[2]))
-        return exons_by_iso, all_coords
+                    if key not in seen:
+                        seen.add(key)
+                        collected.append(key)
+
+        # —— 按 (chrom, start, end) 排序 —— #
+        ordered_coords = sorted(
+            collected,
+            key=lambda x: (x[0], x[1], x[2])  # chrom, start, end
+        )
+
+        return exons_by_iso, ordered_coords
 
     def build_matrix_and_unique(self, result_dict: Dict[str, Any], canonical_first: bool = True):
         exons_by_iso, all_coords = self._flatten_isoform_exons(result_dict)
@@ -273,7 +309,6 @@ class GeneIsoformExonFetcher:
             left_label = f"{chrom}:{self._fmt_thousand(s)} - {self._fmt_thousand(e)}"
             if is_unique:
                 left_label += " *"
-
             row = [left_label]
             row_struct = {"chrom": chrom, "start": s, "end": e, "unique": is_unique}
             for iso in isoforms:
@@ -289,35 +324,52 @@ class GeneIsoformExonFetcher:
 
     def compute_unique_and_reason_map(self, result_dict: Dict[str, Any]) -> Dict[Tuple[str,int,int], Dict[str, Any]]:
         """
-        返回：coord -> {'unique': bool, 'reason': str}
-        reason 取值：
-        - 'single-isoform' : 有效 isoform 仅 1 个（仅该 isoform 真的提供了外显子坐标）
-        - 'multi-isoform'  : 该坐标出现在多个 isoform
-        - 'overlap_prev'   : 与上一相邻区间重叠
-        - 'overlap_next'   : 与下一相邻区间重叠
-        - 'overlap_both'   : 同时与前/后相邻区间重叠
-        - 'unique'         : 满足唯一且与相邻区间均不重叠
-        - 'no-owner'       : 少见（无归属）
+        相邻夹心判断版：
+        - 'single-isoform'：有效 isoform 仅 1 个
+        - 'multi-isoform' ：该坐标属于多个 isoform
+        - 'overlap_prev'  ：curr.start ∈ [prev.start, prev.end]
+        - 'overlap_next'  ：curr.end   ∈ [next.start, next.end]
+        - 'overlap_both'  ：两侧同时满足
+        - 'unique'        ：仅属 1 个 isoform 且两侧均不满足
+        - 'no-owner'
         """
         owners = self.build_unique_index(result_dict)  # coord -> set(isoforms)
-        _, all_coords = self._flatten_isoform_exons(result_dict)
+        _, ordered_coords = self._flatten_isoform_exons(result_dict)  # 已保序 (chrom,start,end)
 
-        # 关键修正：以 owners 的并集，计算“有效 isoform”数量（确实有外显子坐标参与的 isoform）
+        # 统计有效 isoform
         effective_isoforms = set()
         for s in owners.values():
             effective_isoforms.update(s)
-
-        # 若有效 isoform <= 1，则全部标记为 single-isoform（不判定 unique）
         if len(effective_isoforms) <= 1:
-            return {coord: {'unique': False, 'reason': 'single-isoform'} for coord in all_coords}
+            return {coord: {'unique': False, 'reason': 'single-isoform'} for coord in ordered_coords}
 
-        def overlap(a, b) -> bool:
-            # 仅同染色体才判断重叠；闭区间重叠判定
-            return a[0] == b[0] and max(a[1], b[1]) <= min(a[2], b[2])
+        # 按染色体分组，保留组内顺序
+        per_chrom: Dict[str, List[Tuple[str, int, int, int]]] = {}  # ch -> [(ch,s,e,global_idx), ...]
+        for idx, (ch, s, e) in enumerate(ordered_coords):
+            per_chrom.setdefault(ch, []).append((ch, s, e, idx))
+
+        # 两侧“夹心”标志（按 global_idx 存）
+        start_in_prev = [False] * len(ordered_coords)
+        end_in_next   = [False] * len(ordered_coords)
+
+        # 组内按 start,end 稳定排序（ordered_coords 已保序，保险起见再按数值排序）
+        for ch, arr in per_chrom.items():
+            arr.sort(key=lambda t: (t[1], t[2]))  # (ch,s,e,idx)
+            n = len(arr)
+            for j, (_, s, e, gi) in enumerate(arr):
+                # 前一个
+                if j - 1 >= 0:
+                    _, ps, pe, _ = arr[j-1]
+                    if ps is not None and pe is not None:
+                        start_in_prev[gi] = (ps <= s <= pe)
+                # 后一个
+                if j + 1 < n:
+                    _, ns, ne, _ = arr[j+1]
+                    if ns is not None and ne is not None:
+                        end_in_next[gi] = (ns <= e <= ne)
 
         info_map: Dict[Tuple[str,int,int], Dict[str, Any]] = {}
-        n = len(all_coords)
-        for i, coord in enumerate(all_coords):
+        for idx, coord in enumerate(ordered_coords):
             own = owners.get(coord, set())
             if not own:
                 info_map[coord] = {'unique': False, 'reason': 'no-owner'}
@@ -326,9 +378,8 @@ class GeneIsoformExonFetcher:
                 info_map[coord] = {'unique': False, 'reason': 'multi-isoform'}
                 continue
 
-            # 候选唯一：检查与相邻区间是否重叠
-            has_prev = (i - 1 >= 0 and overlap(all_coords[i-1], coord))
-            has_next = (i + 1 < n  and overlap(coord, all_coords[i+1]))
+            has_prev = bool(start_in_prev[idx])
+            has_next = bool(end_in_next[idx])
 
             if has_prev and has_next:
                 info_map[coord] = {'unique': False, 'reason': 'overlap_both'}
@@ -340,6 +391,7 @@ class GeneIsoformExonFetcher:
                 info_map[coord] = {'unique': True,  'reason': 'unique'}
 
         return info_map
+
 
     @staticmethod
     def print_exon_matrix(header, rows, col_widths):
@@ -355,56 +407,40 @@ class GeneIsoformExonFetcher:
 
     def build_tables_for_saving(self, result_dict: Dict[str, Any], out_prefix: str, canonical_first: bool = True) -> pd.DataFrame:
         """
-        生成并保存：
-        {out_prefix}_exon_matrix.csv —— 宽表（矩阵）
+        写 {out_prefix}_exon_matrix.csv
 
-        规则：
-        - unique 判定使用 compute_unique_and_reason_map
-        - 缺失用 "-" 占位
-        - 如果 isoform 列整列都是 "-"，则删除该列
-        - 列排序：canonical 在前，其后同一前缀的 -k 按数字升序
-        - 行排序：若主链为 '+' 则 (chrom, start) 升序；若为 '-' 则 (chrom 升序, start 降序)
+        完全保序（不排序）版本：
+        - 行顺序：严格使用 _flatten_isoform_exons 返回的 ordered_coords（该函数已按 JSON 遍历顺序去重保序）
+        - 列顺序：严格按 result_dict["isoforms"] 出现顺序；仅删除“整列均为 '-'”的 isoform 列
+        - 单元格缺失仍用 '-' 占位
+        - unique / overlap_reason 来自 compute_unique_and_reason_map，但只做标注，不影响顺序
         """
-        from collections import Counter
+        # 1) 取 isoform 的原始顺序
+        isoforms_in_order = [
+            iso.get("accession") for iso in (result_dict.get("isoforms") or [])
+            if iso.get("accession")
+        ]
 
-        # --- 聚合底层结构 ---
-        exons_by_iso, all_coords = self._flatten_isoform_exons(result_dict)
-        isoforms_all = [iso["accession"] for iso in result_dict.get("isoforms", [])]
+        # 2) 底层映射与“按 JSON 顺序的坐标列表”
+        exons_by_iso, ordered_coords = self._flatten_isoform_exons(result_dict)
 
-        # canonical 初步靠前
-        can = result_dict.get("canonical")
-        if canonical_first and can in isoforms_all:
-            isoforms_all = sorted(isoforms_all, key=lambda x: (0 if (x == can or x.startswith(can + "-1")) else 1, x))
-        else:
-            isoforms_all = sorted(isoforms_all)
-
-        # 唯一性与原因
+        # 3) 唯一性/重叠原因（仅标注）
         uniq_info = self.compute_unique_and_reason_map(result_dict)
 
-        # 主链方向（统计 transcripts 的 strand 众数）
-        strands = []
-        for iso in result_dict.get("isoforms", []):
-            coords = iso.get("coordinates") or {}
-            for tx in coords.get("transcripts", []):
-                s = tx.get("strand")
-                if s in ("+", "-"):
-                    strands.append(s)
-        main_strand = Counter(strands).most_common(1)[0][0] if strands else "+"
-
-        # --- 行构造 ---
+        # 4) 按 ordered_coords 原样构造行
         matrix_rows = []
-        for chrom, s, e in all_coords:
+        for chrom, s, e in ordered_coords:
             info = uniq_info.get((chrom, s, e), {'unique': False, 'reason': 'no-owner'})
-            is_unique = bool(info['unique'])
-            reason = str(info['reason'])
-
+            is_unique = bool(info.get('unique', False))
+            reason = str(info.get('reason', ''))
             overlap_conflict = (not is_unique) and reason.startswith('overlap')
 
+            # 如果 unique==True，找该坐标归属的 isoform（按原始列序第一个命中的）
             unique_iso = None
             if is_unique:
-                for iso in isoforms_all:
-                    if (chrom, s, e) in exons_by_iso.get(iso, {}):
-                        unique_iso = iso
+                for iso_acc in isoforms_in_order:
+                    if (chrom, s, e) in exons_by_iso.get(iso_acc, {}):
+                        unique_iso = iso_acc
                         break
 
             row = {
@@ -414,65 +450,41 @@ class GeneIsoformExonFetcher:
                 "unique": is_unique,
                 "unique_isoform": unique_iso,
                 "overlap_conflict": overlap_conflict,
-                "overlap_reason": (reason if overlap_conflict else reason)
+                "overlap_reason": reason if (overlap_conflict or not is_unique) else "unique"
             }
 
-            for iso in isoforms_all:
-                ps, pe = exons_by_iso.get(iso, {}).get((chrom, s, e), (None, None))
-                row[iso] = (f"{ps} - {pe}" if (ps is not None and pe is not None) else "-")
+            # 填每个 isoform 的蛋白坐标；缺失用 '-'
+            for iso_acc in isoforms_in_order:
+                ps, pe = exons_by_iso.get(iso_acc, {}).get((chrom, s, e), (None, None))
+                row[iso_acc] = (f"{ps} - {pe}" if (ps is not None and pe is not None) else "-")
 
             matrix_rows.append(row)
 
         wide_df = pd.DataFrame(matrix_rows)
 
-        # 删除整列均为 "-" 的 isoform 列
-        for iso in isoforms_all:
-            if iso in wide_df.columns and all(wide_df[iso] == "-"):
-                wide_df.drop(columns=[iso], inplace=True)
-
-        # 列顺序：基础列 + isoform 列（排序）
-        def isoform_sort_key(acc: str):
-            if "-" not in acc:
-                return (acc, 0, 0)
-            prefix, suffix = acc.split("-", 1)
-            num_str = "".join(ch for ch in suffix if ch.isdigit())
-            try:
-                num = int(num_str) if num_str else float("inf")
-            except Exception:
-                num = float("inf")
-            return (prefix, 1, num)
-
+        # 5) 删除整列均为 '-' 的 isoform 列（不改变其余列顺序）
         base_cols = ["chrom", "start", "end", "unique", "unique_isoform", "overlap_conflict", "overlap_reason"]
-        iso_cols_sorted = sorted([c for c in wide_df.columns if c not in base_cols], key=isoform_sort_key)
-        wide_df = wide_df[base_cols + iso_cols_sorted]
+        keep_iso_cols = []
+        for iso_acc in isoforms_in_order:
+            if iso_acc in wide_df.columns:
+                col = wide_df[iso_acc]
+                if not (col == "-").all():
+                    keep_iso_cols.append(iso_acc)
+                else:
+                    wide_df.drop(columns=[iso_acc], inplace=True)
 
-        # 行排序
-        def chrom_rank(ch):
-            s = str(ch).strip()
-            s = s[3:] if s.lower().startswith("chr") else s
-            u = s.upper()
-            specials = {"X": 23, "Y": 24, "MT": 25, "M": 25}
-            if u in specials:
-                return (0, specials[u])
-            try:
-                return (0, int(u))
-            except Exception:
-                return (1, u)
+        # 6) 组装最终列顺序（严格保序）
+        final_cols = base_cols + keep_iso_cols
+        wide_df = wide_df[final_cols]
 
-        asc_start = (main_strand == "+")
-        wide_df = wide_df.sort_values(
-            by=["chrom", "start"],
-            ascending=[True, asc_start],
-            key=lambda col: col.map(chrom_rank) if col.name == "chrom" else col
-        ).reset_index(drop=True)
-
-        # --- 保存 ---
+        # 7) 直接写盘（不再 sort）
         out_prefix = Path(out_prefix)
         out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        wide_csv = f"{out_prefix}_exon_matrix.csv"
-        wide_df.to_csv(wide_csv, index=False)
-        print(f"[OK] saved: {wide_csv}")
+        out_csv = f"{out_prefix}_exon_matrix.csv"
+        wide_df.to_csv(out_csv, index=False)
+        print(f"[OK] saved: {out_csv}")
         return wide_df
+
 
     @staticmethod
     def _coord_key_from_exon(ex, default_chrom=None):

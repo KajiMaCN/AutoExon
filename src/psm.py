@@ -1,14 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import json
 import uuid
 import subprocess
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 import pandas as pd
+
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 
@@ -153,7 +149,7 @@ class IsoformCoverageCalculator:
             "area_col": area_col,
             "agg": agg,
             "peptide_rows": peptide_rows.to_dict(orient="records"),
-            "out_file": str(out_file),  # R 支持则写文件；不支持则忽略
+            # "out_file": str(out_file),  # R 支持则写文件；不支持则忽略
         }
 
         try:
