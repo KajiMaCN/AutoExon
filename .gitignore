@@ -1,5 +1,8 @@
 /datasets
 /results
+/results_old
 /data
+/utils
 
 *.pyc
+*.zip

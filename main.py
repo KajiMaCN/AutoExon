@@ -119,7 +119,7 @@ def process_one_gene(gene: str, args, gene2prot) -> tuple[pd.DataFrame | None, d
             print(f"[WARN] Calculator 计算失败：{gene} | {e}")
             return None, None
 
-        # 6) 基于 JSON 的 unique 区间筛选 unique-exon PSM
+        # 6) 基于 JSON 的 unique 区间筛选 unique-exon PSM，并赋 start/end（NEW）
         iso2uniq = {}
         for iso_entry in (json_data.get("isoforms") or []):
             acc_i = iso_entry.get("accession")
@@ -156,15 +156,30 @@ def process_one_gene(gene: str, args, gene2prot) -> tuple[pd.DataFrame | None, d
             if sub_iso.empty:
                 continue
             pos = sub_iso["Position"].astype(int)
+
+            # 给定默认 NA 的 start/end 列（NEW）
+            sub_iso["start"] = pd.NA
+            sub_iso["end"] = pd.NA
+
             m = pd.Series(False, index=sub_iso.index)
             for a, b in intervals:
-                m |= (pos >= a) & (pos <= b)
+                mask = (pos >= a) & (pos <= b)
+                if mask.any():
+                    # 命中的行赋所属 unique 区间（NEW）
+                    sub_iso.loc[mask, "start"] = a
+                    sub_iso.loc[mask, "end"] = b
+                m |= mask
+
             sub_iso = sub_iso.loc[m].copy()
             if sub_iso.empty:
                 continue
             sub_iso["gene"] = gene
             sub_iso["canonical"] = canonical_acc
-            sub_iso = sub_iso[["gene", "canonical", "isoform", "Character", "Position", "id", "label", "value"]]
+            sub_iso = sub_iso[[
+                "gene", "canonical", "isoform",
+                "Character", "Position", "id", "label", "value",
+                "start", "end"
+            ]]
             sub_all.append(sub_iso)
 
         uniq_df = pd.concat(sub_all, ignore_index=True) if sub_all else None
@@ -179,7 +194,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="计算覆盖 PSM"
     )
-    ap.add_argument("--report", default="datasets/Match_result-X401SC24071912_Z01_F001_B1_43/report-matched-M0.csv")
+    ap.add_argument("--report", default="datasets/Match_result-X401SC24071912_Z01_F001_B1_43/report-matched-M0-with-sample.csv")
     ap.add_argument("--gene", default="ALL")
     ap.add_argument("--summary", default="data/combined_69plus10_summary.csv")
     ap.add_argument("--tax-id", default="9606")
@@ -237,18 +252,61 @@ def main():
         out_dir = Path("results")
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 明细
+        # 读取 report 做映射（id -> Sample.Name）（CHG）
+        try:
+            report_df = pd.read_csv(args.report)
+        except Exception as e:
+            raise SystemExit(f"[ERR] 无法读取 report 文件：{args.report} | {e}")
+
+        if "Polypeptide.Novogene.ID" not in report_df.columns:
+            raise SystemExit("[ERR] report 缺少列：Polypeptide.Novogene.ID")
+        if "Sample.Name" not in report_df.columns:
+            raise SystemExit("[ERR] report 缺少列：Sample.Name")
+
+        map_df = report_df[["Polypeptide.Novogene.ID", "Sample.Name"]].drop_duplicates()
+
+        # --- 明细表：merge + 列顺序 + 重命名 value -> psm_value（CHG） ---
+        merged = uniq_all_df.merge(
+            map_df, how="left", left_on="id", right_on="Polypeptide.Novogene.ID"
+        )
+        merged.rename(columns={"id": "Polypeptide.Novogene.ID_from_result"}, inplace=True)
+        merged["Polypeptide.Novogene.ID"] = merged["Polypeptide.Novogene.ID"].fillna(
+            merged["Polypeptide.Novogene.ID_from_result"]
+        )
+        merged.drop(columns=["Polypeptide.Novogene.ID_from_result"], inplace=True)
+
+        # 改列名：value -> psm_value（仅输出更名，计算仍基于 value 已完成）（NEW）
+        merged.rename(columns={"value": "psm_value"}, inplace=True)
+
+        # 列顺序：Sample.Name 首列、Polypeptide.Novogene.ID 第二列，其余保持直观顺序
+        cols_order_detail = (
+            ["Sample.Name", "Polypeptide.Novogene.ID"] +
+            [c for c in merged.columns if c not in ["Sample.Name", "Polypeptide.Novogene.ID"]]
+        )
+        merged = merged[cols_order_detail]
+
         out_psm = out_dir / "unique_psm_by_sample_all.csv"
-        uniq_all_df.to_csv(out_psm, index=False)
+        merged.to_csv(out_psm, index=False)
         print(f"[OK] 写出 unique-exon PSM 明细：{out_psm}")
 
-        # 统计
+        # --- 汇总表：仅在 start/end 相同的行内聚合（通过把 start,end 放进 groupby），并输出列名 psm_value_sum（CHG）---
+        # 注意：为保持聚合后 Sample.Name 能放第一列，且 id->Sample.Name 一一对应，分组键里也包含 Sample.Name
         sum_by_id = (
-            uniq_all_df
-            .groupby(["gene", "canonical", "isoform", "id", "label"], as_index=False)["value"]
+            merged
+            .groupby(
+                ["Sample.Name", "Polypeptide.Novogene.ID", "gene", "canonical", "isoform", "label", "start", "end"],
+                as_index=False
+            )["psm_value"]
             .sum()
-            .rename(columns={"value": "value_sum"})
+            .rename(columns={"psm_value": "psm_value_sum"})   # NEW
         )
+
+        # 列顺序：与需求一致，Sample.Name 第一，Polypeptide.Novogene.ID 第二
+        cols_order_sum = (
+            ["Sample.Name", "Polypeptide.Novogene.ID", "gene", "canonical", "isoform", "label", "start", "end", "psm_value_sum"]
+        )
+        sum_by_id = sum_by_id[cols_order_sum]
+
         out_sum_id = out_dir / "unique_psm_sum_by_id.csv"
         sum_by_id.to_csv(out_sum_id, index=False)
         print(f"[OK] 写出 unique-exon 按 id 聚合：{out_sum_id}")
