@@ -6,7 +6,7 @@ from pathlib import Path
 
 # ===== 输入路径 =====
 meta_path = Path("/workspace/datasets/metadata/experimental-metadata.csv")
-psm_path  = Path("/workspace/results/match/unique_psm_sum_by_sample_nolabel.csv")
+psm_path  = Path("/workspace/results/match/unique_psm_sum_by_sample_nopsm0.csv")
 out_path  = psm_path.with_name("unique_psm_sum_by_sample_with_sample_name.csv")
 
 # ===== 读取文件 =====
