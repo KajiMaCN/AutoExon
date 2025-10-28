@@ -1,7 +1,7 @@
 /datasets
 /results*
 /data
-/utils
+/test
 
 *.pyc
 *.zip
